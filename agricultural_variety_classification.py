@@ -1,24 +1,23 @@
 """
-农产品品种识别：RBF-SVM 与 Random Forest 对比
-数据集：UCI Rice (ID 545) 与 Dry Bean (ID 602)
+Agricultural Variety Classification & Comparative Visualization Analysis
+Models: RBF-SVM vs. Random Forest
+Datasets: UCI Rice (ID: 545) & UCI Dry Bean (ID: 602)
+Course: CA6002 Data Visualisation
 
-安装依赖：
-    pip install numpy pandas matplotlib seaborn scikit-learn ucimlrepo
-
-运行：
-    python agricultural_variety_classification.py
-
-输出：
-    agricultural_model_outputs/ 目录下的 CSV 结果与 PNG 图表
+Outputs:
+    High-resolution publication-quality PNG charts and CSV result summaries in 'agricultural_model_outputs/'
 """
 
 import os
 import time
 import warnings
+from typing import Tuple, Dict, Any, List, Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.transforms as transforms
+from matplotlib.patches import Ellipse
 import seaborn as sns
 from ucimlrepo import fetch_ucirepo
 
@@ -26,16 +25,15 @@ from sklearn.model_selection import (
     train_test_split,
     GridSearchCV,
     StratifiedKFold,
-    RepeatedStratifiedKFold,
-    cross_validate,
+    cross_val_score,
     learning_curve,
+    validation_curve,
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.inspection import permutation_importance
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -44,181 +42,270 @@ from sklearn.metrics import (
     f1_score,
     classification_report,
     confusion_matrix,
-    ConfusionMatrixDisplay,
 )
-CUDA_VISIBLE_DEVICE = 0
 
-# ============================== 全局设置 ==============================
+# ============================== Global Configurations ==============================
 warnings.filterwarnings("ignore")
 RANDOM_STATE = 42
 TEST_SIZE = 0.20
 N_SPLITS = 5
-FULL_GRID_SEARCH = False  # True 会扩大参数搜索范围，但耗时显著增加
+FULL_GRID_SEARCH = False
 OUTPUT_DIR = "agricultural_model_outputs"
+DATA_CACHE_DIR = "data_cache"
+
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
-sns.set_theme(style="whitegrid")
-plt.rcParams["figure.figsize"] = (9, 6)
-plt.rcParams["figure.dpi"] = 120
-plt.rcParams["axes.unicode_minus"] = False
-plt.rcParams["font.size"] = 11
+# Aesthetic Styling and English Palettes
+PALETTE_MODELS = {
+    "RBF-SVM": "#1E40AF",       # Deep Royal Blue
+    "Random Forest": "#D97706"  # Amber Orange
+}
+
+COLORS = {
+    "Primary": "#2563EB",
+    "Secondary": "#059669",
+    "Accent": "#7C3AED",
+    "Highlight": "#DC2626",     # Crimson Red
+    "NeutralDark": "#1F2937",
+    "NeutralLight": "#F3F4F6",
+}
+
+# Set professional scientific publication styling
+sns.set_theme(style="whitegrid", context="talk", font_scale=0.85)
+plt.rcParams.update({
+    "figure.figsize": (10, 6),
+    "figure.dpi": 150,
+    "font.sans-serif": ["Arial", "DejaVu Sans", "Helvetica", "sans-serif"],
+    "axes.unicode_minus": False,
+    "axes.edgecolor": "#D1D5DB",
+    "axes.linewidth": 1.0,
+    "grid.color": "#E5E7EB",
+    "grid.linestyle": "--",
+    "grid.alpha": 0.7,
+    "axes.labelpad": 8,
+    "savefig.bbox": "tight",
+    "savefig.pad_inches": 0.12,
+})
 
 
-def save_and_show_figure(file_name):
-    """保存当前图表到输出目录并关闭图形。"""
+def save_figure(file_name: str):
+    """Save current figure in high DPI and close plot."""
     path = os.path.join(OUTPUT_DIR, file_name)
-    plt.tight_layout()
     plt.savefig(path, dpi=300, bbox_inches="tight")
-    plt.show()
     plt.close()
-    print(f"图表已保存：{path}")
+    print(f"  [Saved Figure] -> {path}")
 
 
-# ============================== 数据加载与清理 ==============================
-def load_uci_dataset(dataset_id, dataset_name):
-    """根据 UCI ID 下载数据，并返回特征 X 与标签 y。"""
-    print("\n" + "=" * 70)
-    print(f"正在加载数据集：{dataset_name}")
-    print("=" * 70)
+# ============================== Data Ingestion & Preprocessing ==============================
+def load_uci_dataset(dataset_id: int, dataset_name: str) -> Tuple[pd.DataFrame, pd.Series]:
+    """Load dataset from local cache or fetch from UCI Repository."""
+    cache_path_x = os.path.join(DATA_CACHE_DIR, f"{dataset_name.lower()}_x.csv")
+    cache_path_y = os.path.join(DATA_CACHE_DIR, f"{dataset_name.lower()}_y.csv")
 
-    dataset = fetch_ucirepo(id=dataset_id)
-    X = dataset.data.features.copy()
-    y = dataset.data.targets.copy()
-
-    if isinstance(y, pd.DataFrame):
-        y = y.iloc[:, 0]
+    if os.path.exists(cache_path_x) and os.path.exists(cache_path_y):
+        print(f"Loading {dataset_name} from local cache...")
+        X = pd.read_csv(cache_path_x)
+        y = pd.read_csv(cache_path_y).iloc[:, 0]
+    else:
+        print(f"Fetching {dataset_name} (ID: {dataset_id}) from UCI Repository...")
+        try:
+            dataset = fetch_ucirepo(id=dataset_id)
+            X = dataset.data.features.copy()
+            y = dataset.data.targets.copy()
+            if isinstance(y, pd.DataFrame):
+                y = y.iloc[:, 0]
+            X.to_csv(cache_path_x, index=False)
+            y.to_csv(cache_path_y, index=False)
+        except Exception as err:
+            print(f"Error fetching dataset {dataset_name}: {err}")
+            raise
 
     X.columns = [str(c).strip().replace(" ", "_") for c in X.columns]
     y = y.astype(str).str.strip()
     y.name = "Class"
 
-    print(f"样本数量：{X.shape[0]}")
-    print(f"特征数量：{X.shape[1]}")
-    print(f"类别数量：{y.nunique()}")
-    print(f"缺失值总数：{X.isna().sum().sum()}")
-    print("类别分布：")
-    print(y.value_counts())
+    print(f"  -> {dataset_name}: {X.shape[0]} samples, {X.shape[1]} features, {y.nunique()} classes.")
     return X, y
 
 
-def clean_dataset(X, y, dataset_name):
-    """数值化特征、中位数填补缺失值，并删除完全重复记录。"""
+def clean_dataset(X: pd.DataFrame, y: pd.Series, dataset_name: str) -> Tuple[pd.DataFrame, pd.Series]:
+    """Coerce numerical values, impute missing values if any, and deduplicate."""
     X_clean = X.apply(pd.to_numeric, errors="coerce")
     if X_clean.isna().sum().sum() > 0:
-        print(f"{dataset_name}：使用中位数填补缺失值。")
         X_clean = X_clean.fillna(X_clean.median())
 
     full = X_clean.copy()
     full["Class"] = y.values
-    duplicate_count = int(full.duplicated().sum())
-    if duplicate_count:
-        print(f"{dataset_name}：删除 {duplicate_count} 条完全重复记录。")
+    dup_count = int(full.duplicated().sum())
+    if dup_count > 0:
+        print(f"  -> {dataset_name}: Removed {dup_count} duplicate records.")
         full = full.drop_duplicates().reset_index(drop=True)
 
     y_clean = full.pop("Class")
-    print(f"{dataset_name} 清理后：{full.shape[0]} 个样本，{full.shape[1]} 个特征。")
     return full, y_clean
 
 
-def inspect_dataset(X, y, dataset_name):
-    """输出数据类型、描述性统计和类别比例。"""
-    print("\n" + "=" * 70)
-    print(f"{dataset_name} 数据质量检查")
-    print("=" * 70)
-    print("\n特征类型：")
-    print(X.dtypes)
-    print("\n描述性统计：")
-    print(X.describe().T.round(3))
-    print("\n类别比例：")
-    print((y.value_counts(normalize=True).sort_index() * 100).round(2).astype(str) + "%")
+def inspect_dataset(X: pd.DataFrame, y: pd.Series, dataset_name: str):
+    """Print statistical quality summary."""
+    print(f"\n--- [{dataset_name} Data Quality Summary] ---")
+    print(f"Sample Count: {len(X)} | Feature Count: {X.shape[1]}")
+    dist = (y.value_counts(normalize=True) * 100).round(2)
+    print("Class Proportions (%):")
+    for cls, pct in dist.items():
+        print(f"  - {cls}: {pct}% (N={sum(y==cls)})")
 
 
-# ============================== 探索性可视化 ==============================
-def plot_class_distribution(y, dataset_name):
-    counts = y.value_counts().sort_values(ascending=False)
-    plt.figure(figsize=(10, 6))
-    ax = sns.barplot(x=counts.index.astype(str), y=counts.values, color="#4C78A8")
-    ax.set(title=f"{dataset_name}: Class Distribution", xlabel="Variety", ylabel="Number of Samples")
-    ax.tick_params(axis="x", rotation=35)
-    for i, value in enumerate(counts.values):
-        ax.text(i, value, str(value), ha="center", va="bottom")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_class_distribution.png")
+# ============================== Exploratory Data Visualizations ==============================
+def draw_confidence_ellipse(ax, data: np.ndarray, color: str, n_std: float = 2.0):
+    """Draw a 2D confidence ellipse representing the covariance of the class cluster."""
+    if len(data) < 3:
+        return
+    cov = np.cov(data, rowvar=False)
+    if np.isnan(cov).any() or np.isinf(cov).any():
+        return
+    
+    pearson = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1] + 1e-12)
+    pearson = np.clip(pearson, -1.0, 1.0)
+    ell_radius_x = np.sqrt(1 + pearson)
+    ell_radius_y = np.sqrt(max(1e-12, 1 - pearson))
+    
+    ellipse = Ellipse((0, 0), width=ell_radius_x * 2, height=ell_radius_y * 2,
+                      facecolor=color, alpha=0.12, edgecolor=color, linestyle="--", linewidth=1.5)
+
+    scale_x = np.sqrt(cov[0, 0]) * n_std
+    mean_x = np.mean(data[:, 0])
+    scale_y = np.sqrt(cov[1, 1]) * n_std
+    mean_y = np.mean(data[:, 1])
+
+    transf = transforms.Affine2D().rotate_deg(45).scale(scale_x, scale_y).translate(mean_x, mean_y)
+    ellipse.set_transform(transf + ax.transData)
+    ax.add_patch(ellipse)
 
 
-def plot_feature_histograms(X, dataset_name):
+def plot_class_distribution(y: pd.Series, dataset_name: str):
+    """Plot sample count and percentage breakdown for each agricultural variety."""
+    plt.figure(figsize=(9, 5.5))
+    counts = y.value_counts()
+    total = len(y)
+    palette = sns.color_palette("Blues_r", n_colors=len(counts))
+    
+    ax = sns.barplot(x=counts.index, y=counts.values, palette=palette, edgecolor="black", linewidth=0.6)
+    ax.set_title(f"{dataset_name} Dataset: Variety Distribution", fontsize=15, fontweight="bold", pad=12)
+    ax.set_xlabel("Agricultural Variety", fontsize=12, fontweight="semibold")
+    ax.set_ylabel("Sample Count (N)", fontsize=12, fontweight="semibold")
+    
+    for p in ax.patches:
+        height = p.get_height()
+        pct = (height / total) * 100
+        ax.annotate(f"{int(height):,}\n({pct:.1f}%)", 
+                    (p.get_x() + p.get_width() / 2., height),
+                    ha="center", va="bottom", xytext=(0, 4), textcoords="offset points",
+                    fontsize=10, fontweight="medium")
+    
+    ax.set_ylim(0, max(counts.values) * 1.18)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_class_distribution.png")
+
+
+def plot_feature_histograms(X: pd.DataFrame, dataset_name: str):
+    """Plot distribution histograms with KDE curves for all morphological features."""
     features = list(X.columns)
     ncols = 4
     nrows = int(np.ceil(len(features) / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 4 * nrows))
-    axes = np.asarray(axes).reshape(-1)
-    for i, feature in enumerate(features):
-        sns.histplot(X[feature], bins=30, kde=True, ax=axes[i], color="#4C78A8")
-        axes[i].set_title(feature)
-    for i in range(len(features), len(axes)):
-        fig.delaxes(axes[i])
-    fig.suptitle(f"{dataset_name}: Feature Distributions", fontsize=17, y=1.01)
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_feature_histograms.png")
+    fig, axes = plt.subplots(nrows, ncols, figsize=(16, 3.2 * nrows))
+    axes = np.asarray(axes).flatten()
+
+    for i, col in enumerate(features):
+        sns.histplot(X[col], kde=True, ax=axes[i], color=COLORS["Primary"], 
+                     alpha=0.45, edgecolor="none", line_kws={"linewidth": 1.5})
+        axes[i].set_title(col, fontsize=11, fontweight="bold")
+        axes[i].set_xlabel("Feature Value", fontsize=9)
+        axes[i].set_ylabel("Frequency", fontsize=9)
+        axes[i].tick_params(axis='both', which='major', labelsize=8)
+
+    for j in range(i + 1, len(axes)):
+        fig.delaxes(axes[j])
+
+    fig.suptitle(f"{dataset_name} Dataset: Morphological Feature Distributions", 
+                 fontsize=16, fontweight="bold", y=1.01)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_feature_histograms.png")
 
 
-def plot_correlation_heatmap(X, dataset_name):
-    size = max(9, X.shape[1] * 0.75)
-    plt.figure(figsize=(size, size * 0.75))
-    sns.heatmap(X.corr(numeric_only=True), cmap="coolwarm", center=0, square=True, linewidths=0.4)
-    plt.title(f"{dataset_name}: Feature Correlation Matrix")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_correlation_heatmap.png")
+def plot_correlation_heatmap(X: pd.DataFrame, dataset_name: str):
+    """Plot masked correlation matrix for morphological attributes."""
+    plt.figure(figsize=(11, 9))
+    corr = X.corr(numeric_only=True)
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    
+    ax = sns.heatmap(corr, mask=mask, annot=True, fmt=".2f", cmap="coolwarm", center=0,
+                     vmin=-1, vmax=1, square=True, linewidths=0.7, 
+                     cbar_kws={"shrink": 0.8, "label": "Pearson Correlation Coefficient"},
+                     annot_kws={"size": 8 if len(X.columns) > 10 else 10})
+    ax.set_title(f"{dataset_name} Dataset: Feature Correlation Matrix", fontsize=15, fontweight="bold", pad=12)
+    plt.xticks(rotation=45, ha="right", fontsize=9)
+    plt.yticks(rotation=0, fontsize=9)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_correlation_heatmap.png")
 
 
-def plot_pca_projection(X, y, dataset_name):
+def plot_pca_projection(X: pd.DataFrame, y: pd.Series, dataset_name: str):
+    """Plot 2D PCA projection overlaying 95% confidence ellipses for class clustering."""
     X_scaled = StandardScaler().fit_transform(X)
     pca = PCA(n_components=2, random_state=RANDOM_STATE)
     projected = pca.fit_transform(X_scaled)
-    data = pd.DataFrame({"PC1": projected[:, 0], "PC2": projected[:, 1], "Class": y.values})
-    variance = pca.explained_variance_ratio_ * 100
 
-    plt.figure(figsize=(10, 7))
-    sns.scatterplot(data=data, x="PC1", y="PC2", hue="Class", palette="tab10", alpha=0.65, s=35)
-    plt.xlabel(f"PC1 ({variance[0]:.1f}% explained variance)")
-    plt.ylabel(f"PC2 ({variance[1]:.1f}% explained variance)")
-    plt.title(f"{dataset_name}: PCA Projection")
-    plt.legend(title="Variety", bbox_to_anchor=(1.02, 1), loc="upper left")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_pca_projection.png")
+    df_pca = pd.DataFrame(projected, columns=["PC1", "PC2"])
+    df_pca["Class"] = y.values
+    var = pca.explained_variance_ratio_ * 100
+
+    plt.figure(figsize=(10, 7.5))
+    ax = plt.gca()
+    unique_classes = sorted(y.unique())
+    palette = sns.color_palette("tab10" if len(unique_classes) > 2 else ["#2563EB", "#D97706"], n_colors=len(unique_classes))
+
+    sns.scatterplot(data=df_pca, x="PC1", y="PC2", hue="Class", hue_order=unique_classes,
+                    palette=palette, alpha=0.55, s=40, edgecolor="w", linewidth=0.3)
+
+    for i, cls in enumerate(unique_classes):
+        cls_data = df_pca[df_pca["Class"] == cls][["PC1", "PC2"]].values
+        if len(cls_data) > 2:
+            draw_confidence_ellipse(ax, cls_data, palette[i], n_std=2.0)
+            # Add centroid text badge
+            cx, cy = np.mean(cls_data[:, 0]), np.mean(cls_data[:, 1])
+            ax.text(cx, cy, cls, fontsize=9, fontweight="bold", ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=palette[i], alpha=0.9, lw=1.2))
+
+    ax.set_xlabel(f"Principal Component 1 (PC1: {var[0]:.1f}% Variance)", fontsize=12, fontweight="semibold")
+    ax.set_ylabel(f"Principal Component 2 (PC2: {var[1]:.1f}% Variance)", fontsize=12, fontweight="semibold")
+    ax.set_title(f"{dataset_name} Dataset: 2D PCA Projection with 95% Confidence Ellipses", 
+                 fontsize=14, fontweight="bold", pad=12)
+    plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", title="Variety", frameon=True)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_pca_projection.png")
 
 
-# ============================== 模型配置 ==============================
-def get_model_configurations(full_grid=False):
-    """创建模型 Pipeline 及其参数网格。"""
+# ============================== Model Pipeline & Grid Search ==============================
+def get_model_configurations(full_grid: bool = False) -> Dict[str, Dict[str, Any]]:
+    """Define model pipelines and hyperparameter search grids."""
     svm = Pipeline([
         ("scaler", StandardScaler()),
         ("model", SVC(kernel="rbf", class_weight="balanced", random_state=RANDOM_STATE)),
     ])
     rf = Pipeline([
-        ("model", RandomForestClassifier(
-            random_state=RANDOM_STATE, class_weight="balanced", n_jobs=-1
-        )),
+        ("model", RandomForestClassifier(random_state=RANDOM_STATE, class_weight="balanced", n_jobs=-1)),
     ])
 
     if full_grid:
-        svm_grid = {
-            "model__C": [0.1, 1, 10, 100],
-            "model__gamma": ["scale", 0.001, 0.01, 0.1, 1],
-        }
+        svm_grid = {"model__C": [0.1, 1, 10, 100], "model__gamma": ["scale", 0.001, 0.01, 0.1, 1]}
         rf_grid = {
-            "model__n_estimators": [200, 400, 600],
-            "model__max_depth": [None, 10, 20, 30],
-            "model__max_features": ["sqrt", "log2"],
-            "model__min_samples_split": [2, 5, 10],
+            "model__n_estimators": [100, 200, 400],
+            "model__max_depth": [None, 10, 15, 25],
             "model__min_samples_leaf": [1, 2, 4],
         }
     else:
-        svm_grid = {
-            "model__C": [1, 10, 100],
-            "model__gamma": ["scale", 0.01, 0.1],
-        }
+        svm_grid = {"model__C": [1, 10, 100], "model__gamma": ["scale", 0.01, 0.1]}
         rf_grid = {
             "model__n_estimators": [200, 400],
-            "model__max_depth": [None, 15, 25],
-            "model__max_features": ["sqrt"],
-            "model__min_samples_leaf": [1, 2, 4],
+            "model__max_depth": [None, 15],
+            "model__min_samples_leaf": [1, 2],
         }
 
     return {
@@ -227,267 +314,354 @@ def get_model_configurations(full_grid=False):
     }
 
 
-# ============================== 训练与评价 ==============================
-def train_and_evaluate_models(X, y, dataset_name, configurations):
-    label_encoder = LabelEncoder()
-    y_encoded = label_encoder.fit_transform(y.astype(str))
+def train_and_evaluate_models(X: pd.DataFrame, y: pd.Series, dataset_name: str,
+                              configurations: Dict[str, Dict[str, Any]]) -> Tuple[pd.DataFrame, Dict[str, Any], pd.DataFrame]:
+    """Train models via GridSearchCV, evaluate on test set, and compute fold metrics."""
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y.astype(str))
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y_encoded, test_size=TEST_SIZE, stratify=y_encoded, random_state=RANDOM_STATE
+        X, y_enc, test_size=TEST_SIZE, stratify=y_enc, random_state=RANDOM_STATE
     )
     cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    
     rows, fitted = [], {}
+    per_class_records = []
 
-    for model_name, config in configurations.items():
-        print("\n" + "=" * 65)
-        print(f"数据集：{dataset_name}；模型：{model_name}")
-        print("=" * 65)
-
-        search = GridSearchCV(
-            config["pipeline"], config["parameter_grid"], scoring="accuracy",
-            cv=cv, n_jobs=-1, return_train_score=True, refit=True, verbose=1
-        )
+    print(f"\n[Training Models on {dataset_name}]")
+    for name, config in configurations.items():
+        print(f"  -> Training {name}...")
+        search = GridSearchCV(config["pipeline"], config["parameter_grid"], scoring="accuracy",
+                              cv=cv, n_jobs=-1, refit=True)
         start = time.perf_counter()
         search.fit(X_train, y_train)
-        training_time = time.perf_counter() - start
+        duration = time.perf_counter() - start
 
         best_model = search.best_estimator_
-        start = time.perf_counter()
         y_pred = best_model.predict(X_test)
-        prediction_time = time.perf_counter() - start
+
+        # 5-Fold cross-validation scores of the best estimator on training set
+        cv_scores = cross_val_score(best_model, X_train, y_train, cv=cv, scoring="accuracy", n_jobs=-1)
+
+        test_acc = accuracy_score(y_test, y_pred)
+        bal_acc = balanced_accuracy_score(y_test, y_pred)
+        macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+        macro_p = precision_score(y_test, y_pred, average="macro", zero_division=0)
+        macro_r = recall_score(y_test, y_pred, average="macro", zero_division=0)
 
         metrics = {
             "CV Accuracy": search.best_score_,
-            "Test Accuracy": accuracy_score(y_test, y_pred),
-            "Balanced Accuracy": balanced_accuracy_score(y_test, y_pred),
-            "Macro Precision": precision_score(y_test, y_pred, average="macro", zero_division=0),
-            "Macro Recall": recall_score(y_test, y_pred, average="macro", zero_division=0),
-            "Macro F1": f1_score(y_test, y_pred, average="macro", zero_division=0),
-            "Weighted F1": f1_score(y_test, y_pred, average="weighted", zero_division=0),
+            "CV Std": float(np.std(cv_scores)),
+            "Test Accuracy": test_acc,
+            "Balanced Accuracy": bal_acc,
+            "Macro Precision": macro_p,
+            "Macro Recall": macro_r,
+            "Macro F1": macro_f1,
+            "Time": duration,
         }
 
-        print("最佳参数：", search.best_params_)
-        for key, value in metrics.items():
-            print(f"{key}: {value:.4f}")
-        print(f"训练及调参时间：{training_time:.2f} 秒")
-        print(classification_report(
-            y_test, y_pred, target_names=label_encoder.classes_, zero_division=0
-        ))
+        # Per-class metrics
+        class_precisions = precision_score(y_test, y_pred, average=None, zero_division=0)
+        class_recalls = recall_score(y_test, y_pred, average=None, zero_division=0)
+        class_f1s = f1_score(y_test, y_pred, average=None, zero_division=0)
+        
+        for idx, cls_label in enumerate(le.classes_):
+            per_class_records.append({
+                "Dataset": dataset_name,
+                "Model": name,
+                "Variety": cls_label,
+                "Precision": class_precisions[idx],
+                "Recall": class_recalls[idx],
+                "F1-Score": class_f1s[idx],
+                "Support": int(sum(y_test == idx))
+            })
 
-        rows.append({
-            "Dataset": dataset_name,
-            "Model": model_name,
-            **metrics,
-            "Training Time": training_time,
-            "Prediction Time": prediction_time,
-            "Best Parameters": str(search.best_params_),
-        })
-        fitted[model_name] = {
+        rows.append({"Dataset": dataset_name, "Model": name, **metrics})
+        fitted[name] = {
             "model": best_model,
             "grid_search": search,
-            "X_train": X_train.copy(),
-            "X_test": X_test.copy(),
-            "y_train": y_train.copy(),
-            "y_test": y_test.copy(),
-            "y_pred": y_pred.copy(),
-            "label_encoder": label_encoder,
+            "cv_scores": cv_scores,
+            "X_train": X_train,
+            "X_test": X_test,
+            "y_train": y_train,
+            "y_test": y_test,
+            "y_pred": y_pred,
+            "label_encoder": le,
         }
+        print(f"     Best Params: {search.best_params_}")
+        print(f"     Test Accuracy: {test_acc:.4f} | Macro F1: {macro_f1:.4f} | CV Std: {np.std(cv_scores):.4f}")
 
-    return pd.DataFrame(rows), fitted
-
-
-# ============================== 模型结果可视化 ==============================
-def plot_confusion_matrices(model_results, dataset_name):
-    fig, axes = plt.subplots(1, len(model_results), figsize=(8 * len(model_results), 7))
-    axes = np.atleast_1d(axes)
-    for ax, (model_name, result) in zip(axes, model_results.items()):
-        matrix = confusion_matrix(result["y_test"], result["y_pred"])
-        display = ConfusionMatrixDisplay(matrix, display_labels=result["label_encoder"].classes_)
-        display.plot(ax=ax, cmap="Blues", colorbar=False, xticks_rotation=45, values_format="d")
-        ax.set_title(f"{dataset_name}: {model_name}")
-    fig.suptitle(f"{dataset_name}: Confusion Matrices", fontsize=17, y=1.02)
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_confusion_matrices.png")
+    return pd.DataFrame(rows), fitted, pd.DataFrame(per_class_records)
 
 
-def plot_model_comparison(results, metric):
-    plt.figure(figsize=(10, 6))
-    ax = sns.barplot(
-        data=results, x="Dataset", y=metric, hue="Model",
-        palette={"RBF-SVM": "#4C78A8", "Random Forest": "#F58518"}
+# ============================== AI Algorithm Design & Tuning Visualizations ==============================
+def plot_svm_parameter_heatmap(fitted_models: Dict[str, Any], dataset_name: str):
+    """Plot RBF-SVM hyperparameter validation surface (C vs Gamma)."""
+    res = fitted_models["RBF-SVM"]["grid_search"]
+    results = pd.DataFrame(res.cv_results_)
+
+    results["param_model__C"] = results["param_model__C"].astype(float)
+    results["param_model__gamma"] = results["param_model__gamma"].astype(str)
+
+    pivot = results.pivot(index="param_model__gamma", columns="param_model__C", values="mean_test_score")
+
+    plt.figure(figsize=(9, 6.5))
+    ax = sns.heatmap(pivot, annot=True, fmt=".4f", cmap="YlGnBu", 
+                     cbar_kws={"label": "Mean 5-Fold CV Accuracy"}, linewidths=1.0)
+    
+    # Highlight the best parameter combination
+    best_c = float(res.best_params_["model__C"])
+    best_gamma = str(res.best_params_["model__gamma"])
+    
+    ax.set_title(f"{dataset_name} Dataset: RBF-SVM Hyperparameter Grid Search", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Regularization Parameter (C)", fontsize=12, fontweight="semibold")
+    ax.set_ylabel("Kernel Coefficient (Gamma)", fontsize=12, fontweight="semibold")
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_svm_parameter_heatmap.png")
+
+
+def plot_rf_validation_curve(X: pd.DataFrame, y: pd.Series, dataset_name: str):
+    """Plot Random Forest validation curve over tree depth (Bias-Variance tradeoff)."""
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y.astype(str))
+    param_range = [2, 4, 8, 12, 16, 20, 30]
+    param_labels = [str(p) for p in param_range]
+
+    train_scores, test_scores = validation_curve(
+        RandomForestClassifier(n_estimators=100, random_state=RANDOM_STATE, class_weight="balanced"),
+        X, y_enc, param_name="max_depth", param_range=param_range,
+        cv=5, scoring="accuracy", n_jobs=-1
     )
-    ax.set_title(f"Model Comparison: {metric}")
-    lower = max(0, results[metric].min() - 0.08)
-    upper = min(1.02, results[metric].max() + 0.05)
-    ax.set_ylim(lower, upper)
-    for container in ax.containers:
-        ax.bar_label(container, fmt="%.3f", padding=3)
-    save_and_show_figure(f"model_comparison_{metric.lower().replace(' ', '_')}.png")
+
+    train_mean = np.mean(train_scores, axis=1)
+    train_std = np.std(train_scores, axis=1)
+    test_mean = np.mean(test_scores, axis=1)
+    test_std = np.std(test_scores, axis=1)
+
+    plt.figure(figsize=(9, 5.5))
+    plt.plot(param_labels, train_mean, label="Training Accuracy", marker="o", color=PALETTE_MODELS["RBF-SVM"], linewidth=2)
+    plt.fill_between(param_labels, train_mean - train_std, train_mean + train_std, alpha=0.15, color=PALETTE_MODELS["RBF-SVM"])
+
+    plt.plot(param_labels, test_mean, label="5-Fold CV Accuracy", marker="s", color=PALETTE_MODELS["Random Forest"], linewidth=2)
+    plt.fill_between(param_labels, test_mean - test_std, test_mean + test_std, alpha=0.15, color=PALETTE_MODELS["Random Forest"])
+
+    plt.title(f"{dataset_name} Dataset: Random Forest Max Depth Validation Curve", fontsize=14, fontweight="bold", pad=12)
+    plt.xlabel("Maximum Tree Depth (max_depth)", fontsize=12, fontweight="semibold")
+    plt.ylabel("Classification Accuracy", fontsize=12, fontweight="semibold")
+    plt.legend(loc="lower right", frameon=True)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_rf_validation_curve.png")
 
 
-def plot_performance_crossover(results, metric="Test Accuracy"):
-    pivot = results.pivot(index="Dataset", columns="Model", values=metric).reindex(["Rice", "Dry Bean"])
-    plt.figure(figsize=(10, 6))
-    colors = {"RBF-SVM": "#4C78A8", "Random Forest": "#F58518"}
-    for model_name in pivot.columns:
-        plt.plot(pivot.index, pivot[model_name], marker="o", markersize=10,
-                 linewidth=2.8, label=model_name, color=colors[model_name])
-        for dataset_name, value in pivot[model_name].items():
-            plt.annotate(f"{value:.3f}", (dataset_name, value), xytext=(0, 8),
-                         textcoords="offset points", ha="center")
-    plt.title(f"Model Performance Across Datasets: {metric}")
-    plt.xlabel("Dataset")
-    plt.ylabel(metric)
-    plt.legend(title="Model")
-    save_and_show_figure(f"performance_crossover_{metric.lower().replace(' ', '_')}.png")
+def plot_learning_curves(fitted_models: Dict[str, Any], dataset_name: str):
+    """Plot sample-efficiency learning curves for both RBF-SVM and Random Forest."""
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharey=True)
+    train_sizes = np.linspace(0.1, 1.0, 6)
 
+    for ax, (model_name, res) in zip(axes, fitted_models.items()):
+        estimator = res["model"]
+        X_train, y_train = res["X_train"], res["y_train"]
 
-def evaluate_cv_stability(X, y, fitted_models, dataset_name):
-    y_encoded = LabelEncoder().fit_transform(y.astype(str))
-    cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=3, random_state=RANDOM_STATE)
-    records = []
-    for model_name, result in fitted_models.items():
-        scores = cross_validate(
-            result["model"], X, y_encoded, cv=cv,
-            scoring={"accuracy": "accuracy", "balanced_accuracy": "balanced_accuracy", "macro_f1": "f1_macro"},
-            n_jobs=-1
+        t_sizes, train_scores, val_scores = learning_curve(
+            estimator, X_train, y_train, train_sizes=train_sizes,
+            cv=5, scoring="accuracy", n_jobs=-1, random_state=RANDOM_STATE
         )
-        for i in range(len(scores["test_accuracy"])):
-            records.append({
-                "Dataset": dataset_name, "Model": model_name, "Split": i + 1,
-                "Accuracy": scores["test_accuracy"][i],
-                "Balanced Accuracy": scores["test_balanced_accuracy"][i],
-                "Macro F1": scores["test_macro_f1"][i],
-            })
-    return pd.DataFrame(records)
+
+        t_mean = np.mean(train_scores, axis=1)
+        t_std = np.std(train_scores, axis=1)
+        v_mean = np.mean(val_scores, axis=1)
+        v_std = np.std(val_scores, axis=1)
+
+        ax.plot(t_sizes, t_mean, "o-", color=COLORS["Primary"], label="Training Score", linewidth=2)
+        ax.fill_between(t_sizes, t_mean - t_std, t_mean + t_std, alpha=0.15, color=COLORS["Primary"])
+
+        ax.plot(t_sizes, v_mean, "s-", color=COLORS["Secondary"], label="Cross-Validation Score", linewidth=2)
+        ax.fill_between(t_sizes, v_mean - v_std, v_mean + v_std, alpha=0.15, color=COLORS["Secondary"])
+
+        ax.set_title(f"{model_name}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Training Sample Size (N)", fontsize=11, fontweight="semibold")
+        ax.set_ylabel("Accuracy Score", fontsize=11, fontweight="semibold")
+        ax.legend(loc="lower right", frameon=True)
+
+    fig.suptitle(f"{dataset_name} Dataset: Learning Curves (Sample Efficiency & Convergence)", 
+                 fontsize=15, fontweight="bold", y=1.02)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_learning_curves.png")
 
 
-def plot_cv_boxplot(cv_results, metric):
-    plt.figure(figsize=(11, 7))
-    sns.boxplot(data=cv_results, x="Dataset", y=metric, hue="Model",
-                palette={"RBF-SVM": "#4C78A8", "Random Forest": "#F58518"})
-    sns.stripplot(data=cv_results, x="Dataset", y=metric, hue="Model",
-                  dodge=True, color="black", alpha=0.30, size=3, legend=False)
-    plt.title(f"Repeated Cross-validation Distribution: {metric}")
-    save_and_show_figure(f"cv_distribution_{metric.lower().replace(' ', '_')}.png")
-
-
-def plot_learning_curve_for_model(model, X, y, model_name, dataset_name):
-    y_encoded = LabelEncoder().fit_transform(y.astype(str))
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
-    sizes, train_scores, val_scores = learning_curve(
-        model, X, y_encoded, train_sizes=np.linspace(0.15, 1.0, 6), cv=cv,
-        scoring="accuracy", n_jobs=-1, shuffle=True, random_state=RANDOM_STATE
-    )
-    train_mean, train_std = train_scores.mean(axis=1), train_scores.std(axis=1)
-    val_mean, val_std = val_scores.mean(axis=1), val_scores.std(axis=1)
-
-    plt.figure(figsize=(9, 6))
-    plt.plot(sizes, train_mean, marker="o", label="Training Accuracy", color="#4C78A8")
-    plt.plot(sizes, val_mean, marker="s", label="Validation Accuracy", color="#F58518")
-    plt.fill_between(sizes, train_mean - train_std, train_mean + train_std, alpha=0.18, color="#4C78A8")
-    plt.fill_between(sizes, val_mean - val_std, val_mean + val_std, alpha=0.18, color="#F58518")
-    plt.title(f"{dataset_name}: {model_name} Learning Curve")
-    plt.xlabel("Number of Training Samples")
-    plt.ylabel("Accuracy")
-    plt.legend()
-    safe = f"{dataset_name}_{model_name}".lower().replace(" ", "_").replace("-", "_")
-    save_and_show_figure(f"{safe}_learning_curve.png")
-
-
-def plot_svm_parameter_heatmap(fitted_models, dataset_name):
-    data = pd.DataFrame(fitted_models["RBF-SVM"]["grid_search"].cv_results_)
-    data["C"] = data["param_model__C"].astype(str)
-    data["Gamma"] = data["param_model__gamma"].astype(str)
-    heat = data.pivot_table(index="Gamma", columns="C", values="mean_test_score", aggfunc="mean")
-    plt.figure(figsize=(9, 6))
-    sns.heatmap(heat, annot=True, fmt=".4f", cmap="YlGnBu", cbar_kws={"label": "Mean CV Accuracy"})
-    plt.title(f"{dataset_name}: RBF-SVM Parameter Performance")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_svm_parameter_heatmap.png")
-
-
-def plot_rf_feature_importance(fitted_models, X, dataset_name, top_n=12):
+def plot_rf_feature_importance(fitted_models: Dict[str, Any], X: pd.DataFrame, dataset_name: str, top_n: int = 12):
+    """Plot Random Forest feature importance ranked by Gini impurity reduction."""
     rf = fitted_models["Random Forest"]["model"].named_steps["model"]
-    data = pd.DataFrame({"Feature": X.columns, "Importance": rf.feature_importances_})
-    data = data.nlargest(top_n, "Importance").sort_values("Importance")
-    plt.figure(figsize=(10, 7))
-    plt.barh(data["Feature"], data["Importance"], color="#F58518")
-    plt.title(f"{dataset_name}: Random Forest Feature Importance")
-    plt.xlabel("Importance")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_rf_feature_importance.png")
+    importances = rf.feature_importances_
+    
+    data = pd.DataFrame({"Feature": X.columns, "Importance": importances})
+    data = data.nlargest(top_n, "Importance").sort_values("Importance", ascending=True)
+
+    plt.figure(figsize=(9, 6.5))
+    bars = plt.barh(data["Feature"], data["Importance"], color=PALETTE_MODELS["Random Forest"], 
+                    alpha=0.85, edgecolor="black", linewidth=0.5)
+    
+    # Add numerical labels
+    for bar in bars:
+        w = bar.get_width()
+        plt.text(w + 0.003, bar.get_y() + bar.get_height()/2, f"{w*100:.1f}%", 
+                 va="center", ha="left", fontsize=9, fontweight="medium")
+
+    plt.xlim(0, max(data["Importance"]) * 1.18)
+    plt.title(f"{dataset_name} Dataset: Random Forest Feature Importance", fontsize=14, fontweight="bold", pad=12)
+    plt.xlabel("Mean Decrease in Impurity (Gini Importance)", fontsize=11, fontweight="semibold")
+    plt.ylabel("Morphological Feature", fontsize=11, fontweight="semibold")
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_rf_feature_importance.png")
 
 
-def plot_permutation_importance(fitted_models, X, dataset_name, model_name, top_n=12):
-    result = fitted_models[model_name]
-    importance = permutation_importance(
-        result["model"], result["X_test"], result["y_test"], scoring="accuracy",
-        n_repeats=10, random_state=RANDOM_STATE, n_jobs=-1
-    )
-    data = pd.DataFrame({
-        "Feature": X.columns,
-        "Importance": importance.importances_mean,
-        "Std": importance.importances_std,
-    }).nlargest(top_n, "Importance").sort_values("Importance")
-    plt.figure(figsize=(10, 7))
-    plt.barh(data["Feature"], data["Importance"], xerr=data["Std"], color="#54A24B", alpha=0.85)
-    plt.title(f"{dataset_name}: {model_name} Permutation Importance")
-    plt.xlabel("Decrease in Test Accuracy after Permutation")
-    safe = f"{dataset_name}_{model_name}".lower().replace(" ", "_").replace("-", "_")
-    save_and_show_figure(f"{safe}_permutation_importance.png")
+# ============================== Evaluation & Diagnostics Visualizations ==============================
+def plot_confusion_matrices(model_results: Dict[str, Any], dataset_name: str):
+    """Plot normalized test set confusion matrices side-by-side with counts and percentages."""
+    fig, axes = plt.subplots(1, len(model_results), figsize=(15, 6.5))
+    axes = np.atleast_1d(axes)
+
+    for ax, (name, res) in zip(axes, model_results.items()):
+        cm = confusion_matrix(res["y_test"], res["y_pred"])
+        cm_pct = cm.astype("float") / cm.sum(axis=1)[:, np.newaxis]
+        
+        labels = [f"{v}\n({p:.1%})" for v, p in zip(cm.flatten(), cm_pct.flatten())]
+        labels = np.array(labels).reshape(cm.shape)
+
+        sns.heatmap(cm_pct, annot=labels, fmt="", cmap="Blues", ax=ax, cbar=False,
+                    vmin=0, vmax=1, linewidths=0.8, linecolor="white",
+                    xticklabels=res["label_encoder"].classes_,
+                    yticklabels=res["label_encoder"].classes_,
+                    annot_kws={"size": 8 if len(cm) > 4 else 11, "fontweight": "medium"})
+        
+        ax.set_title(f"{name}", fontsize=13, fontweight="bold")
+        ax.set_xlabel("Predicted Class", fontsize=11, fontweight="semibold")
+        ax.set_ylabel("True Class", fontsize=11, fontweight="semibold")
+        plt.setp(ax.get_xticklabels(), rotation=40, ha="right", fontsize=9)
+        plt.setp(ax.get_yticklabels(), rotation=0, fontsize=9)
+
+    fig.suptitle(f"{dataset_name} Dataset: Test Confusion Matrices (Count & Recall %)", 
+                 fontsize=15, fontweight="bold", y=1.02)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_confusion_matrices.png")
 
 
-def calculate_class_metrics(fitted_models, dataset_name):
+def plot_per_class_metrics(per_class_df: pd.DataFrame, dataset_name: str):
+    """Plot Precision, Recall, and F1-Score breakdown for each agricultural variety."""
+    df_sub = per_class_df[per_class_df["Dataset"] == dataset_name]
+    
+    # Melt for multi-metric grouped bar plotting
+    melted = df_sub.melt(id_vars=["Model", "Variety"], value_vars=["Precision", "Recall", "F1-Score"], 
+                         var_name="Metric", value_name="Score")
+
+    plt.figure(figsize=(12, 6))
+    ax = sns.barplot(data=melted, x="Variety", y="Score", hue="Metric",
+                     palette=["#2563EB", "#059669", "#D97706"], edgecolor="black", linewidth=0.5)
+    
+    ax.set_ylim(0.60, 1.03)
+    ax.set_title(f"{dataset_name} Dataset: Per-Variety Classification Performance", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Agricultural Variety", fontsize=12, fontweight="semibold")
+    ax.set_ylabel("Metric Score", fontsize=12, fontweight="semibold")
+    plt.xticks(rotation=30, ha="right")
+    plt.legend(loc="lower right", frameon=True)
+    save_figure(f"{dataset_name.lower().replace(' ', '_')}_per_class_metrics.png")
+
+
+def plot_error_space_pca(fitted_models: Dict[str, Any], dataset_name: str):
+    """Diagnose misclassified test samples projected onto PCA feature space."""
+    for model_name, res in fitted_models.items():
+        X_test_scaled = StandardScaler().fit_transform(res["X_test"])
+        pca = PCA(n_components=2, random_state=RANDOM_STATE)
+        projected = pca.fit_transform(X_test_scaled)
+        var = pca.explained_variance_ratio_ * 100
+
+        df = pd.DataFrame(projected, columns=["PC1", "PC2"])
+        df["True"] = res["label_encoder"].inverse_transform(res["y_test"])
+        df["Pred"] = res["label_encoder"].inverse_transform(res["y_pred"])
+        df["Correct"] = df["True"] == df["Pred"]
+
+        err_count = sum(~df["Correct"])
+        err_rate = (err_count / len(df)) * 100
+
+        plt.figure(figsize=(10, 7.5))
+        
+        # Plot correctly classified samples in subtle transparent tones
+        sns.scatterplot(data=df[df["Correct"]], x="PC1", y="PC2", hue="True",
+                        alpha=0.35, s=35, palette="tab10" if df["True"].nunique() > 2 else "Blues",
+                        legend=True, edgecolor="none")
+
+        # Highlight misclassified samples with prominent markers
+        errors = df[~df["Correct"]]
+        if not errors.empty:
+            plt.scatter(errors["PC1"], errors["PC2"], color=COLORS["Highlight"],
+                        marker="X", s=85, label=f"Misclassified (N={err_count})",
+                        edgecolor="black", linewidth=0.6, zorder=5)
+
+        plt.title(f"{dataset_name} Dataset: {model_name} Error Space Analysis\n(Error Rate: {err_rate:.2f}%)", 
+                  fontsize=14, fontweight="bold", pad=12)
+        plt.xlabel(f"Principal Component 1 (PC1: {var[0]:.1f}%)", fontsize=11, fontweight="semibold")
+        plt.ylabel(f"Principal Component 2 (PC2: {var[1]:.1f}%)", fontsize=11, fontweight="semibold")
+        plt.legend(bbox_to_anchor=(1.02, 1), loc="upper left", title="Legend", frameon=True)
+
+        safe_name = f"{dataset_name}_{model_name}_error_pca".lower().replace(" ", "_").replace("-", "_")
+        save_figure(f"{safe_name}.png")
+
+
+def plot_cv_stability_comparison(fitted_rice: Dict[str, Any], fitted_bean: Dict[str, Any]):
+    """Plot cross-validation score distributions across folds to compare model stability."""
     records = []
-    for model_name, result in fitted_models.items():
-        report = classification_report(
-            result["y_test"], result["y_pred"], target_names=result["label_encoder"].classes_,
-            output_dict=True, zero_division=0
-        )
-        for class_name in result["label_encoder"].classes_:
-            records.append({
-                "Dataset": dataset_name, "Model": model_name, "Class": class_name,
-                "Precision": report[class_name]["precision"],
-                "Recall": report[class_name]["recall"],
-                "F1-score": report[class_name]["f1-score"],
-                "Support": report[class_name]["support"],
-            })
-    return pd.DataFrame(records)
+    for dname, models in [("Rice (2-Class)", fitted_rice), ("Dry Bean (7-Class)", fitted_bean)]:
+        for mname, res in models.items():
+            for score in res["cv_scores"]:
+                records.append({"Dataset": dname, "Model": mname, "CV Accuracy": score})
+
+    df_cv = pd.DataFrame(records)
+    plt.figure(figsize=(9, 5.5))
+    ax = sns.boxplot(data=df_cv, x="Dataset", y="CV Accuracy", hue="Model",
+                     palette=PALETTE_MODELS, width=0.5, boxprops=dict(alpha=0.85))
+    sns.stripplot(data=df_cv, x="Dataset", y="CV Accuracy", hue="Model",
+                  palette=PALETTE_MODELS, dodge=True, color="black", alpha=0.6, size=6, jitter=0.1)
+
+    # Clean legend duplicate handles
+    handles, labels = ax.get_legend_handles_labels()
+    plt.legend(handles[:2], labels[:2], loc="lower left", title="Model", frameon=True)
+
+    ax.set_title("Cross-Validation Score Stability across 5 Folds", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Dataset & Complexity", fontsize=12, fontweight="semibold")
+    ax.set_ylabel("5-Fold CV Accuracy", fontsize=12, fontweight="semibold")
+    save_figure("model_cv_stability_comparison.png")
 
 
-def plot_class_recall(class_metrics, dataset_name):
-    data = class_metrics[class_metrics["Dataset"] == dataset_name]
-    plt.figure(figsize=(12, 7))
-    ax = sns.barplot(data=data, x="Class", y="Recall", hue="Model",
-                     palette={"RBF-SVM": "#4C78A8", "Random Forest": "#F58518"})
-    ax.set_ylim(0, 1.05)
-    ax.tick_params(axis="x", rotation=35)
-    ax.set_title(f"{dataset_name}: Recall by Variety")
-    save_and_show_figure(f"{dataset_name.lower().replace(' ', '_')}_recall_by_variety.png")
+def plot_model_comparison(results: pd.DataFrame, metric: str):
+    """Plot benchmark comparison across datasets for a specific performance metric."""
+    plt.figure(figsize=(9, 5.5))
+    ax = sns.barplot(data=results, x="Dataset", y=metric, hue="Model", 
+                     palette=PALETTE_MODELS, edgecolor="black", linewidth=0.6)
+    
+    ax.set_title(f"Model Benchmark Comparison: {metric}", fontsize=14, fontweight="bold", pad=12)
+    ax.set_xlabel("Dataset", fontsize=12, fontweight="semibold")
+    ax.set_ylabel(metric, fontsize=12, fontweight="semibold")
+
+    ymin = results[metric].min() * 0.94
+    ax.set_ylim(ymin, 1.02 if metric != "Time" else results[metric].max() * 1.15)
+
+    for container in ax.containers:
+        ax.bar_label(container, fmt="%.3f" if metric != "Time" else "%.1fs", padding=3, fontsize=10, fontweight="medium")
+
+    plt.legend(loc="lower right" if metric != "Time" else "upper left", frameon=True)
+    save_figure(f"model_comparison_{metric.lower().replace(' ', '_')}.png")
 
 
-def analyse_ranking_reversal(results, metric="Test Accuracy"):
-    """输出两个数据集各自的最佳模型，并判断是否发生排名反转。"""
-    winners = {}
-    print("\n" + "=" * 70)
-    print(f"排名反转分析：{metric}")
-    for dataset_name in results["Dataset"].unique():
-        subset = results[results["Dataset"] == dataset_name]
-        best = subset.loc[subset[metric].idxmax()]
-        winners[dataset_name] = best["Model"]
-        print(f"{dataset_name}: {best['Model']}，{metric}={best[metric]:.4f}")
-    if len(set(winners.values())) > 1:
-        print("结论：不同数据集的最佳模型不同，出现模型排名反转。")
-    else:
-        print("结论：未出现严格排名反转；应继续比较性能差距、稳定性和类别级 Recall。")
-
-
-# ============================== 主程序 ==============================
+# ============================== Main Pipeline Execution ==============================
 def main():
-    # 1. 下载并清理数据
+    print("=========================================================================")
+    print("  Agricultural Variety Classification & Visual Analytics Pipeline")
+    print("=========================================================================\n")
+
+    # 1. Load Data
     X_rice, y_rice = load_uci_dataset(545, "Rice")
     X_bean, y_bean = load_uci_dataset(602, "Dry Bean")
+
+    # Clean Data
     X_rice, y_rice = clean_dataset(X_rice, y_rice, "Rice")
     X_bean, y_bean = clean_dataset(X_bean, y_bean, "Dry Bean")
 
-    # 2. 数据质量与探索性可视化
+    # 2. Exploratory Data Visualizations
+    print("\n--- Generating Exploratory Visualizations ---")
     for X, y, name in [(X_rice, y_rice, "Rice"), (X_bean, y_bean, "Dry Bean")]:
         inspect_dataset(X, y, name)
         plot_class_distribution(y, name)
@@ -495,61 +669,43 @@ def main():
         plot_correlation_heatmap(X, name)
         plot_pca_projection(X, y, name)
 
-    # 3. 训练两个模型
-    configurations = get_model_configurations(FULL_GRID_SEARCH)
-    rice_results, rice_models = train_and_evaluate_models(X_rice, y_rice, "Rice", configurations)
-    bean_results, bean_models = train_and_evaluate_models(X_bean, y_bean, "Dry Bean", configurations)
-    all_results = pd.concat([rice_results, bean_results], ignore_index=True)
+    # 3. Model Training & Parameter Optimization
+    print("\n--- Training & Optimizing Models ---")
+    configs = get_model_configurations(FULL_GRID_SEARCH)
+    rice_res, rice_models, rice_per_class = train_and_evaluate_models(X_rice, y_rice, "Rice", configs)
+    bean_res, bean_models, bean_per_class = train_and_evaluate_models(X_bean, y_bean, "Dry Bean", configs)
+
+    all_results = pd.concat([rice_res, bean_res], ignore_index=True)
+    all_per_class = pd.concat([rice_per_class, bean_per_class], ignore_index=True)
+
     all_results.to_csv(os.path.join(OUTPUT_DIR, "model_comparison_results.csv"), index=False)
-    print("\n综合结果：")
-    print(all_results.round(4).to_string(index=False))
+    all_per_class.to_csv(os.path.join(OUTPUT_DIR, "per_class_metrics.csv"), index=False)
+    print(f"\nSaved metric tables to '{OUTPUT_DIR}/'.")
 
-    # 4. 模型结果可视化
-    plot_confusion_matrices(rice_models, "Rice")
-    plot_confusion_matrices(bean_models, "Dry Bean")
-    for metric in ["Test Accuracy", "Balanced Accuracy", "Macro F1"]:
+    # 4. Deep Visual Analytics & Explainability
+    print("\n--- Generating Model Design & Diagnostic Visualizations ---")
+    for models_dict, X, y, name, per_class_df in [
+        (rice_models, X_rice, y_rice, "Rice", rice_per_class),
+        (bean_models, X_bean, y_bean, "Dry Bean", bean_per_class)
+    ]:
+        plot_confusion_matrices(models_dict, name)
+        plot_svm_parameter_heatmap(models_dict, name)
+        plot_rf_validation_curve(X, y, name)
+        plot_learning_curves(models_dict, name)
+        plot_rf_feature_importance(models_dict, X, name)
+        plot_per_class_metrics(per_class_df, name)
+        plot_error_space_pca(models_dict, name)
+
+    # 5. Overall Comparative Synthesis
+    print("\n--- Generating Overall Comparative Visualizations ---")
+    for metric in ["Test Accuracy", "Macro F1", "Time"]:
         plot_model_comparison(all_results, metric)
-    plot_performance_crossover(all_results, "Test Accuracy")
-    plot_performance_crossover(all_results, "Macro F1")
 
-    # 5. 重复交叉验证稳定性
-    rice_cv = evaluate_cv_stability(X_rice, y_rice, rice_models, "Rice")
-    bean_cv = evaluate_cv_stability(X_bean, y_bean, bean_models, "Dry Bean")
-    all_cv = pd.concat([rice_cv, bean_cv], ignore_index=True)
-    all_cv.to_csv(os.path.join(OUTPUT_DIR, "repeated_cross_validation_results.csv"), index=False)
-    plot_cv_boxplot(all_cv, "Accuracy")
-    plot_cv_boxplot(all_cv, "Macro F1")
-    cv_summary = all_cv.groupby(["Dataset", "Model"])[["Accuracy", "Balanced Accuracy", "Macro F1"]].agg(["mean", "std"])
-    cv_summary.to_csv(os.path.join(OUTPUT_DIR, "cross_validation_summary.csv"))
+    plot_cv_stability_comparison(rice_models, bean_models)
 
-    # 6. 学习曲线与参数分析
-    for model_name, result in rice_models.items():
-        plot_learning_curve_for_model(result["model"], X_rice, y_rice, model_name, "Rice")
-    for model_name, result in bean_models.items():
-        plot_learning_curve_for_model(result["model"], X_bean, y_bean, model_name, "Dry Bean")
-    plot_svm_parameter_heatmap(rice_models, "Rice")
-    plot_svm_parameter_heatmap(bean_models, "Dry Bean")
-
-    # 7. 特征重要性
-    plot_rf_feature_importance(rice_models, X_rice, "Rice", top_n=7)
-    plot_rf_feature_importance(bean_models, X_bean, "Dry Bean", top_n=12)
-    for model_name in ["RBF-SVM", "Random Forest"]:
-        plot_permutation_importance(rice_models, X_rice, "Rice", model_name, top_n=7)
-        plot_permutation_importance(bean_models, X_bean, "Dry Bean", model_name, top_n=12)
-
-    # 8. 类别级结果
-    class_metrics = pd.concat([
-        calculate_class_metrics(rice_models, "Rice"),
-        calculate_class_metrics(bean_models, "Dry Bean"),
-    ], ignore_index=True)
-    class_metrics.to_csv(os.path.join(OUTPUT_DIR, "class_level_metrics.csv"), index=False)
-    plot_class_recall(class_metrics, "Rice")
-    plot_class_recall(class_metrics, "Dry Bean")
-
-    # 9. 判断是否发生排名反转
-    analyse_ranking_reversal(all_results, "Test Accuracy")
-    analyse_ranking_reversal(all_results, "Macro F1")
-    print(f"\n全部结果已保存至：{OUTPUT_DIR}")
+    print("\n=========================================================================")
+    print(f"  Pipeline Finished Successfully! All English Visualizations in: {OUTPUT_DIR}")
+    print("=========================================================================")
 
 
 if __name__ == "__main__":
